@@ -3,7 +3,6 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.integrate import solve_ivp
 from tqdm import tqdm
 from PIL import Image
 
@@ -25,20 +24,15 @@ DEFAULT_CONFIG = {
         "t_start_s": 0.0,
         "rise_time_s": 8.0e-6,
         "dc_offset_v": 0.0,
-        "resistance_ohm": 316.23,  # Source resistance for Pi and Bergeron
+        "resistance_ohm": 316.23,
     },
     "load": {
         "kind": "resistive",  # Options: "open", "resistive"
-        "resistance_ohm": 1*316.23,
+        "resistance_ohm_values": [10.0 * 316.23, 0.1 * 316.23, 1.0 * 316.23],
     },
     "simulation": {
-        "n_values": [50, 100],
         "time_end_s": 0.5e-3,
         "dt_s": 1.0e-7,
-        "solver_method": "RK45",
-        "rtol": 1.0e-7,
-        "atol": 1.0e-9,
-        "max_step_s": 1.0e-7,
     },
     "animation": {
         "fps": 10,
@@ -46,9 +40,10 @@ DEFAULT_CONFIG = {
         "spatial_points": 100,
         "figsize": (12, 6),
         "dpi": 50,
-        "y_margin": 0.10,
+        "y_min_kv": -10.0,
+        "y_max_kv": 10.0,
         "max_bounces": 40,
-        "gif_name": "comparison_pi_1_10_100_bergeron.gif",
+        "gif_name": "comparison_bergeron_loads.gif",
     },
 }
 
@@ -127,149 +122,6 @@ def source_voltage_array(t: np.ndarray, source_cfg: dict) -> np.ndarray:
 
 
 # =========================
-# Pi-model parameters
-# =========================
-def build_pi_parameters(n_sections: int, line_cfg: dict) -> dict:
-    length_total = float(line_cfg["length_m"])
-    r_per_m = float(line_cfg["r_per_m_ohm"])
-    l_per_m = float(line_cfg["l_per_m_h"])
-    c_per_m = float(line_cfg["c_per_m_f"])
-
-    dx = length_total / n_sections
-    r_sec = r_per_m * dx
-    l_sec = l_per_m * dx
-    c_sec = c_per_m * dx
-
-    shunt_caps = np.full(n_sections + 1, c_sec, dtype=float)
-    shunt_caps[0] = 0.5 * c_sec
-    shunt_caps[-1] = 0.5 * c_sec
-
-    return {
-        "dx_m": dx,
-        "r_sec_ohm": r_sec,
-        "l_sec_h": l_sec,
-        "c_sec_f": c_sec,
-        "shunt_caps_f": shunt_caps,
-        "z0_est_ohm": math.sqrt(l_per_m / c_per_m),
-        "velocity_est_m_per_s": 1.0 / math.sqrt(l_per_m * c_per_m),
-        "travel_time_s": length_total * math.sqrt(l_per_m * c_per_m),
-    }
-
-
-# =========================
-# Pi-model ODE
-# State vector:
-# [i0, i1, ..., i_{N-1}, v0, v1, ..., vN]
-# =========================
-def line_ode(
-    t: float,
-    x: np.ndarray,
-    n_sections: int,
-    params: dict,
-    source_cfg: dict,
-    load_cfg: dict,
-) -> np.ndarray:
-    currents = x[:n_sections]
-    voltages = x[n_sections:]
-
-    r_sec = params["r_sec_ohm"]
-    l_sec = params["l_sec_h"]
-    shunt_caps = params["shunt_caps_f"]
-
-    v_source_ideal = source_voltage(t, source_cfg)
-    r_source = max(float(source_cfg.get("resistance_ohm", 0.0)), 1.0e-9)
-
-    di_dt = np.zeros_like(currents)
-    dv_dt = np.zeros_like(voltages)
-
-    for k in range(n_sections):
-        v_left = voltages[k]
-        v_right = voltages[k + 1]
-        di_dt[k] = (v_left - v_right - r_sec * currents[k]) / l_sec
-
-    i_source = (v_source_ideal - voltages[0]) / r_source
-
-    dv_dt[0] = (i_source - currents[0]) / shunt_caps[0]
-
-    for j in range(1, n_sections):
-        dv_dt[j] = (currents[j - 1] - currents[j]) / shunt_caps[j]
-
-    load_kind = load_cfg["kind"].lower()
-
-    if load_kind == "open":
-        i_load = 0.0
-    elif load_kind == "resistive":
-        r_load = max(float(load_cfg["resistance_ohm"]), 1.0e-9)
-        i_load = voltages[-1] / r_load
-    else:
-        raise ValueError(f"Unsupported load kind: {load_kind}")
-
-    dv_dt[-1] = (currents[-1] - i_load) / shunt_caps[-1]
-
-    return np.concatenate([di_dt, dv_dt])
-
-
-# =========================
-# Pi-model simulation
-# =========================
-def simulate_case(n_sections: int, config: dict) -> dict:
-    line_cfg = config["line"]
-    source_cfg = config["source"]
-    load_cfg = config["load"]
-    sim_cfg = config["simulation"]
-
-    params = build_pi_parameters(n_sections, line_cfg)
-
-    dt = float(sim_cfg["dt_s"])
-    time_end = float(sim_cfg["time_end_s"])
-
-    n_steps = int(np.floor(time_end / dt))
-    t_eval = np.arange(n_steps + 1, dtype=float) * dt
-
-    if t_eval[-1] < time_end:
-        t_eval = np.append(t_eval, time_end)
-    else:
-        t_eval[-1] = time_end
-
-    x0 = np.zeros(n_sections + (n_sections + 1), dtype=float)
-
-    solution = solve_ivp(
-        fun=lambda t, x: line_ode(t, x, n_sections, params, source_cfg, load_cfg),
-        t_span=(0.0, time_end),
-        y0=x0,
-        t_eval=t_eval,
-        method=sim_cfg["solver_method"],
-        rtol=sim_cfg["rtol"],
-        atol=sim_cfg["atol"],
-        max_step=min(float(sim_cfg["max_step_s"]), dt),
-    )
-
-    if not solution.success:
-        raise RuntimeError(f"Simulation failed for N={n_sections}: {solution.message}")
-
-    currents = solution.y[:n_sections, :]
-    voltages = solution.y[n_sections:, :]
-
-    source_trace = source_voltage_array(solution.t, source_cfg)
-    r_source = max(float(source_cfg.get("resistance_ohm", 0.0)), 1.0e-9)
-    i_source = (source_trace - voltages[0, :]) / r_source
-
-    return {
-        "model_name": f"Pi N={n_sections}",
-        "N": n_sections,
-        "t": solution.t,
-        "currents": currents,
-        "voltages": voltages,
-        "v_source_ideal": source_trace,
-        "v_send": voltages[0, :],
-        "v_recv": voltages[-1, :],
-        "i_source": i_source,
-        "i_send": currents[0, :],
-        "params": params,
-    }
-
-
-# =========================
 # Bergeron helpers
 # =========================
 def reflection_coefficient(z_term: float, z0: float) -> float:
@@ -283,26 +135,14 @@ def reflection_coefficient(z_term: float, z0: float) -> float:
     return (z_term - z0) / denom
 
 
-def get_load_impedance(load_cfg: dict) -> float:
-    load_kind = load_cfg["kind"].lower()
-
-    if load_kind == "open":
-        return np.inf
-
-    if load_kind == "resistive":
-        return max(float(load_cfg["resistance_ohm"]), 1.0e-12)
-
-    raise ValueError(f"Unsupported load kind: {load_kind}")
-
-
 def build_bergeron_profiles(
     frame_times: np.ndarray,
     x_positions_m: np.ndarray,
     config: dict,
+    load_resistance_ohm: float,
 ) -> np.ndarray:
     line_cfg = config["line"]
     source_cfg = config["source"]
-    load_cfg = config["load"]
     anim_cfg = config["animation"]
 
     length_m = float(line_cfg["length_m"])
@@ -313,7 +153,7 @@ def build_bergeron_profiles(
     velocity = 1.0 / math.sqrt(l_per_m * c_per_m)
 
     z_source = max(float(source_cfg.get("resistance_ohm", 0.0)), 1.0e-12)
-    z_load = get_load_impedance(load_cfg)
+    z_load = max(float(load_resistance_ohm), 1.0e-12)
 
     gamma_s = reflection_coefficient(z_source, z0)
     gamma_l = reflection_coefficient(z_load, z0)
@@ -326,7 +166,7 @@ def build_bergeron_profiles(
 
     v_total = np.zeros((len(x_positions_m), len(frame_times)), dtype=float)
 
-    for m_idx in tqdm(range(max_bounces), desc="Bergeron reconstruction"):
+    for m_idx in tqdm(range(max_bounces), desc=f"Bergeron RL={z_load:.2f} ohm"):
         amp_forward = launch_coeff * (gamma_s * gamma_l) ** m_idx
         time_forward = t_grid - (2.0 * m_idx * length_m + x_grid) / velocity
         v_total = v_total + amp_forward * source_voltage_array(time_forward, source_cfg)
@@ -336,34 +176,6 @@ def build_bergeron_profiles(
         v_total = v_total + amp_backward * source_voltage_array(time_backward, source_cfg)
 
     return v_total
-
-
-# =========================
-# Spatial reconstruction for Pi
-# =========================
-def reconstruct_pi_profiles_for_frames(
-    case_data: dict,
-    x_query_m: np.ndarray,
-    frame_indices: np.ndarray,
-) -> np.ndarray:
-    node_positions_m = np.linspace(
-        0.0,
-        case_data["params"]["dx_m"] * case_data["N"],
-        case_data["N"] + 1,
-    )
-
-    voltage_nodes_frames = case_data["voltages"][:, frame_indices]
-
-    spatial_matrix = np.empty((len(x_query_m), len(frame_indices)), dtype=float)
-
-    for col in tqdm(range(len(frame_indices)), desc=f"Reconstructing Pi N={case_data['N']}"):
-        spatial_matrix[:, col] = np.interp(
-            x_query_m,
-            node_positions_m,
-            voltage_nodes_frames[:, col],
-        )
-
-    return spatial_matrix
 
 
 # =========================
@@ -380,56 +192,36 @@ def figure_to_image(fig: plt.Figure) -> Image.Image:
 def save_gif_from_profiles(
     x_km: np.ndarray,
     frame_times_ms: np.ndarray,
-    pi_profiles_by_n_kv: dict,
-    bergeron_profiles_kv: np.ndarray,
+    bergeron_profiles_by_label_kv: dict,
     gif_path: Path,
     config: dict,
 ) -> list:
     anim_cfg = config["animation"]
 
-    all_mins = []
-    all_maxs = []
-
-    for arr in pi_profiles_by_n_kv.values():
-        all_mins.append(float(np.min(arr)))
-        all_maxs.append(float(np.max(arr)))
-
-    all_mins.append(float(np.min(bergeron_profiles_kv)))
-    all_maxs.append(float(np.max(bergeron_profiles_kv)))
-
-    y_min = min(all_mins)
-    y_max = max(all_maxs)
-    y_span = y_max - y_min
-    y_margin = float(anim_cfg["y_margin"]) * max(y_span, 1.0)
-
-    y_min = y_min - y_margin
-    y_max = y_max + y_margin
-
     fig, ax = plt.subplots(figsize=anim_cfg["figsize"], dpi=int(anim_cfg["dpi"]))
 
-    line_n50, = ax.plot([], [], lw=2, label="Pi N=50")
-    line_n100, = ax.plot([], [], lw=2, label="Pi N=100")
-    line_bergeron, = ax.plot([], [], lw=2, linestyle="--", label="Bergeron")
+    lines = {}
+    for label in bergeron_profiles_by_label_kv:
+        line_obj, = ax.plot([], [], lw=4, label=label, alpha=0.5)
+        lines[label] = line_obj
 
     time_text = ax.text(0.02, 0.95, "", transform=ax.transAxes, va="top")
 
     ax.set_xlim(x_km[0], x_km[-1])
-    ax.set_ylim(-10, 10)
+    ax.set_ylim(float(anim_cfg["y_min_kv"]), float(anim_cfg["y_max_kv"]))
     ax.set_xlabel("Posicao ao longo da linha [km]")
     ax.set_ylabel("Tensao [kV]")
-    ax.set_title("Perfil de Tensao ao longo da linha: Modelos Pi vs Bergeron")
+    ax.set_title("Perfil de Tensao ao longo da linha: Bergeron")
     ax.grid(True)
-    ax.legend(loc="upper right")
+    #ax.legend(loc="upper right")
 
     frames = []
 
     for frame_idx in tqdm(range(len(frame_times_ms)), desc="Rendering GIF"):
-        line_n50.set_data(x_km, pi_profiles_by_n_kv[50][:, frame_idx])
-        line_n100.set_data(x_km, pi_profiles_by_n_kv[100][:, frame_idx])
-        line_bergeron.set_data(x_km, bergeron_profiles_kv[:, frame_idx])
+        for label, line_obj in lines.items():
+            line_obj.set_data(x_km, bergeron_profiles_by_label_kv[label][:, frame_idx])
 
         time_text.set_text(f"t = {frame_times_ms[frame_idx]:.3f} ms")
-
         frames.append(figure_to_image(fig).copy())
 
     plt.close(fig)
@@ -474,51 +266,57 @@ def main() -> None:
     base_dir = Path(__file__).resolve().parent
     dirs = ensure_output_dirs(base_dir)
 
-    n_values = DEFAULT_CONFIG["simulation"]["n_values"]
-    required_n = [50, 100]
+    sim_cfg = DEFAULT_CONFIG["simulation"]
+    anim_cfg = DEFAULT_CONFIG["animation"]
+    load_cfg = DEFAULT_CONFIG["load"]
 
-    if sorted(n_values) != sorted(required_n):
-        raise ValueError("Set simulation.n_values exactly to [50, 100].")
+    dt = float(sim_cfg["dt_s"])
+    time_end = float(sim_cfg["time_end_s"])
 
-    results_by_n = {}
+    n_steps = int(np.floor(time_end / dt))
+    time_reference = np.arange(n_steps + 1, dtype=float) * dt
 
-    for n_sections in tqdm(n_values, desc="Pi simulations"):
-        results_by_n[n_sections] = simulate_case(n_sections, DEFAULT_CONFIG)
+    if time_reference[-1] < time_end:
+        time_reference = np.append(time_reference, time_end)
+    else:
+        time_reference[-1] = time_end
 
-    time_reference = results_by_n[50]["t"]
-    frame_stride = max(1, int(DEFAULT_CONFIG["animation"]["frame_stride"]))
+    frame_stride = max(1, int(anim_cfg["frame_stride"]))
     frame_indices = np.arange(0, len(time_reference), frame_stride)
 
     frame_times = time_reference[frame_indices]
     frame_times_ms = frame_times * 1.0e3
 
-    spatial_points = int(DEFAULT_CONFIG["animation"]["spatial_points"])
+    spatial_points = int(anim_cfg["spatial_points"])
     x_query_m = np.linspace(0.0, float(DEFAULT_CONFIG["line"]["length_m"]), spatial_points)
     x_query_km = x_query_m / 1000.0
 
-    pi_profiles_by_n = {}
-    for n_value in n_values:
-        pi_profiles_by_n[n_value] = reconstruct_pi_profiles_for_frames(
-            results_by_n[n_value],
+    z0 = math.sqrt(
+        float(DEFAULT_CONFIG["line"]["l_per_m_h"]) /
+        float(DEFAULT_CONFIG["line"]["c_per_m_f"])
+    )
+
+    bergeron_profiles_by_label = {}
+
+    for load_resistance in load_cfg["resistance_ohm_values"]:
+        label = f"Bergeron RL={load_resistance / z0:.1f}*Z0"
+        bergeron_profiles_by_label[label] = build_bergeron_profiles(
+            frame_times,
             x_query_m,
-            frame_indices,
+            DEFAULT_CONFIG,
+            load_resistance,
         )
 
-    bergeron_profiles = build_bergeron_profiles(frame_times, x_query_m, DEFAULT_CONFIG)
+    bergeron_profiles_by_label_kv = {}
+    for label in bergeron_profiles_by_label:
+        bergeron_profiles_by_label_kv[label] = bergeron_profiles_by_label[label] / 1.0e3
 
-    pi_profiles_by_n_kv = {}
-    for n_value in n_values:
-        pi_profiles_by_n_kv[n_value] = pi_profiles_by_n[n_value] / 1.0e3
-
-    bergeron_profiles_kv = bergeron_profiles / 1.0e3
-
-    gif_path = dirs["animations"] / DEFAULT_CONFIG["animation"]["gif_name"]
+    gif_path = dirs["animations"] / anim_cfg["gif_name"]
 
     saved_files = save_gif_from_profiles(
         x_query_km,
         frame_times_ms,
-        pi_profiles_by_n_kv,
-        bergeron_profiles_kv,
+        bergeron_profiles_by_label_kv,
         gif_path,
         DEFAULT_CONFIG,
     )
